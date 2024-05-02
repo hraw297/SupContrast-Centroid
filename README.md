@@ -1,1 +1,1 @@
-# SupCon-Centroid
+# SupContrast-Centroid

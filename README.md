@@ -1,1 +1,1 @@
-# SupContrast-Centroid
+# Supervised Contrastive Learning with Centroids

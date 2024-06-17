@@ -15,20 +15,23 @@ import sys
 import time
 import math
 import random
+import argparse
 import datetime
 import subprocess
 from collections import defaultdict, deque
 
 import numpy as np
 import torch
+from torchvision import transforms
 from torch import nn
 import torch.distributed as dist
 from PIL import ImageFilter, ImageOps
 
 
 class DataAugmentation(object):
-    def __init__(self, dataset, size):
+    def __init__(self, dataset, count=10):
 
+        self.count = count
         if dataset == 'cifar10':
             mean = (0.4914, 0.4822, 0.4465)
             std = (0.2023, 0.1994, 0.2010)
@@ -44,6 +47,8 @@ class DataAugmentation(object):
         elif dataset == 'path':
             mean = eval(opt.mean)
             std = eval(opt.std)
+        else:
+            print(f"Unknow dataset: {dataset}")
 
         normalize = transforms.Normalize(mean=mean, std=std)
 
@@ -57,6 +62,13 @@ class DataAugmentation(object):
             transforms.ToTensor(),
             normalize,
         ])
+
+
+    def __call__(self, x):
+        lst = []
+        for i in range(self.count):
+            lst.append(self.transform(x))
+        return lst
 
 
 class GaussianBlur(object):
@@ -228,8 +240,8 @@ def bool_flag(s):
     """
     Parse boolean arguments from the command line.
     """
-    FALSY_STRINGS = {"off", "false", "0"}
-    TRUTHY_STRINGS = {"on", "true", "1"}
+    FALSY_STRINGS = {"off", "false", "False", "0"}
+    TRUTHY_STRINGS = {"on", "true", "True", "1"}
     if s.lower() in FALSY_STRINGS:
         return False
     elif s.lower() in TRUTHY_STRINGS:
@@ -245,6 +257,68 @@ def fix_random_seeds(seed=31):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
+
+
+class SmoothedValue(object):
+    """Track a series of values and provide access to smoothed values over a
+    window or the global series average.
+    """
+
+    def __init__(self, window_size=20, fmt=None):
+        if fmt is None:
+            fmt = "{median:.6f} ({global_avg:.6f})"
+        self.deque = deque(maxlen=window_size)
+        self.total = 0.0
+        self.count = 0
+        self.fmt = fmt
+
+    def update(self, value, n=1):
+        self.deque.append(value)
+        self.count += n
+        self.total += value * n
+
+    def synchronize_between_processes(self):
+        """
+        Warning: does not synchronize the deque!
+        """
+        if not is_dist_avail_and_initialized():
+            return
+        t = torch.tensor([self.count, self.total], dtype=torch.float64, device='cuda')
+        dist.barrier()
+        dist.all_reduce(t)
+        t = t.tolist()
+        self.count = int(t[0])
+        self.total = t[1]
+
+    @property
+    def median(self):
+        d = torch.tensor(list(self.deque))
+        return d.median().item()
+
+    @property
+    def avg(self):
+        d = torch.tensor(list(self.deque), dtype=torch.float32)
+        return d.mean().item()
+
+    @property
+    def global_avg(self):
+        return self.total / self.count
+
+    @property
+    def max(self):
+        return max(self.deque)
+
+    @property
+    def value(self):
+        return self.deque[-1]
+
+    def __str__(self):
+        return self.fmt.format(
+            median=self.median,
+            avg=self.avg,
+            global_avg=self.global_avg,
+            max=self.max,
+            value=self.value)
 
 
 class MetricLogger(object):
@@ -403,7 +477,6 @@ def setup_for_distributed(is_master):
 
 def init_distributed_mode(args):
     # launched with torch.distributed.launch
-    print(os.environ)
     print(args.local_rank)
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
         print('rank in evn')
@@ -411,10 +484,10 @@ def init_distributed_mode(args):
         args.world_size = int(os.environ['WORLD_SIZE'])
         args.gpu = int(os.environ['LOCAL_RANK'])
     # launched with submitit on a slurm cluster
-    elif 'SLURM_PROCID' in os.environ:
-        print('slurm in env')
-        args.rank = int(os.environ['SLURM_PROCID'])
-        args.gpu = args.rank % torch.cuda.device_count()
+    # elif 'SLURM_PROCID' in os.environ:
+    #     print('slurm in env')
+    #     args.rank = int(os.environ['SLURM_PROCID'])
+    #     args.gpu = args.rank % torch.cuda.device_count()
     # launched naively with `python main_dino.py`
     # we manually add MASTER_ADDR and MASTER_PORT to env variables
     elif torch.cuda.is_available():
@@ -691,43 +764,8 @@ def multi_scale(samples, model):
     return v
 
 
-class DataAugmentation(object):
-    def __init__(self, dataset, size, count=10):
-
-        self.count = count
-        if dataset == 'cifar10':
-            mean = (0.4914, 0.4822, 0.4465)
-            std = (0.2023, 0.1994, 0.2010)
-            size = 32
-        elif dataset == 'cifar100':
-            mean = (0.5071, 0.4867, 0.4408)
-            std = (0.2675, 0.2565, 0.2761)
-            size = 32
-        elif dataset == 'imagenet':
-            mean = (0.485, 0.456, 0.406)
-            std = (0.229, 0.224, 0.225)
-            size = 224
-        elif dataset == 'path':
-            mean = eval(opt.mean)
-            std = eval(opt.std)
-
-        normalize = transforms.Normalize(mean=mean, std=std)
-
-        self.transform = transforms.Compose([
-            transforms.RandomResizedCrop(size=size, scale=(0.2, 1.)),
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomApply([
-                transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)
-            ], p=0.8),
-            transforms.RandomGrayscale(p=0.2),
-            transforms.ToTensor(),
-            normalize,
-        ])
-
-
-    def __call__(self, x):
-        lst = []
-        for i in range(count):
-            lst.append(self.transform(x))
-        return lst
+def collect_output(output, batch, aug_count):
+    f_all = torch.split(output, [batch] * aug_count, dim=0)
+    t_features = torch.cat([f.unsqueeze(1) for f in f_all], dim=1)
+    return t_features
 

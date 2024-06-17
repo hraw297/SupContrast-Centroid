@@ -82,8 +82,8 @@ def get_args_parser():
     parser.add_argument('--data_path', default='/path/to/imagenet/train/', type=str,
         help='Please specify path to the ImageNet training data.')
     parser.add_argument('--output_dir', default=".", type=str, help='Path to save logs and checkpoints.')
-    parser.add_argument('--saveckp_freq', default=20, type=int, help='Save checkpoint every x epochs.')
-    parser.add_argument('--seed', default=0, type=int, help='Random seed.')
+    parser.add_argument('--saveckp_freq', default=5, type=int, help='Save checkpoint every x epochs.')
+    parser.add_argument('--seed', default=111, type=int, help='Random seed.')# 111 222 333
     parser.add_argument('--num_workers', default=4, type=int, help='Number of data loading workers per GPU.')
     parser.add_argument("--dist_url", default="env://", type=str, help="""url used to set up
         distributed training; see https://pytorch.org/docs/stable/distributed.html""")
@@ -92,7 +92,16 @@ def get_args_parser():
         choices=['imagenet', 'cifar10', 'cifar100'], help="Set dataset name.")
     # parser.add_argument("--loss_type", default='dino', type=str,
     #     choices=['dino', 'supcon'], help="Loss type.")
-    parser.add_argument('--use_centroid', action='store_true', help="Please ignore and do not set this argument.")
+    parser.add_argument('--use_centroid', default=False, type=utils.bool_flag,\
+        help="Use centroids.")
+    parser.add_argument('--use_dual_net', default=False, type=utils.bool_flag,\
+        help="Use student-teacher networks.")
+    parser.add_argument('--use_fixed_centroids', default=False, type=utils.bool_flag,\
+        help="Use pretrained fixed centroids.")
+    parser.add_argument('--alpha', default=0.1, type=float,\
+        help="Alpha for equation 1.")
+    parser.add_argument('--eq_type', default='eq1', type=str,\
+        choices=['eq1', 'eq2', 'eq3'], help="Equation type.")
     return parser
 
 
@@ -134,8 +143,13 @@ def train_supconcen(args):
         # teacher = torchvision_models.__dict__[args.arch]()
         # embed_dim = student.fc.weight.shape[1]
         student = SupConResNet(name=args.arch)
-        teacher = SupConResNet(name=args.arch)
         embed_dim = student.embed_dim
+        student = student.cuda()
+        teacher = None
+
+        if args.use_dual_net:
+            teacher = SupConResNet(name=args.arch)
+            teacher = teacher.cuda()
     else:
         print(f"Unknow architecture: {args.arch}")
 
@@ -149,28 +163,36 @@ def train_supconcen(args):
     # )
 
     # move networks to gpu
-    student, teacher = student.cuda(), teacher.cuda()
     # synchronize batch norms (if any)
+
+    teacher_without_ddp = None
     if utils.has_batchnorms(student):
         student = nn.SyncBatchNorm.convert_sync_batchnorm(student)
-        teacher = nn.SyncBatchNorm.convert_sync_batchnorm(teacher)
 
-        # we need DDP wrapper to have synchro batch norms working...
-        teacher = nn.parallel.DistributedDataParallel(teacher, device_ids=[args.gpu])
-        teacher_without_ddp = teacher.module
+        if args.use_dual_net:
+            teacher = nn.SyncBatchNorm.convert_sync_batchnorm(teacher)
+
+            # we need DDP wrapper to have synchro batch norms working...
+            teacher = nn.parallel.DistributedDataParallel(teacher, device_ids=[args.gpu])
+            teacher_without_ddp = teacher.module
     else:
-        # teacher_without_ddp and teacher are the same thing
-        teacher_without_ddp = teacher
+        if args.use_dual_net:
+            # teacher_without_ddp and teacher are the same thing
+            teacher_without_ddp = teacher
+
+
     student = nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu])
-    # teacher and student start with the same weights
-    teacher_without_ddp.load_state_dict(student.module.state_dict())
-    # there is no backpropagation through the teacher, so no need for gradients
-    for p in teacher.parameters():
-        p.requires_grad = False
-    print(f"Student and Teacher are built: they are both {args.arch} network.")
+    
+    if args.use_dual_net:
+        # teacher and student start with the same weights
+        teacher_without_ddp.load_state_dict(student.module.state_dict())
+        # there is no backpropagation through the teacher, so no need for gradients
+        for p in teacher.parameters():
+            p.requires_grad = False
+        print(f"Student and Teacher are built: they are both {args.arch} network.")
 
     # ============ preparing loss ... ============
-    criterion = SupConLoss(temperature=0.07).cuda()
+    criterion = SupConLoss(temperature=0.07, contrast_mode=args.eq_type).cuda()
     
     # ============ preparing optimizer ... ============
     params_groups = utils.get_params_groups(student)
@@ -211,6 +233,10 @@ def train_supconcen(args):
     )
     start_epoch = to_restore["epoch"]
 
+    means = None
+    if args.use_fixed_centroids:
+        means = torch.load('mean.pt').cuda()
+
     start_time = time.time()
     print("Starting SupConCen training !")
     for epoch in range(start_epoch, args.epochs):
@@ -219,12 +245,12 @@ def train_supconcen(args):
         # ============ training one epoch of SupConCen ... ============
         train_stats = train_one_epoch(student, teacher, teacher_without_ddp, criterion,
             data_loader, aug_count, optimizer, lr_schedule, wd_schedule, momentum_schedule,
-            epoch, num_lbls, args)
+            epoch, num_lbls, means, args.alpha, args)
 
         # ============ writing logs ... ============
         save_dict = {
             'student': student.state_dict(),
-            'teacher': teacher.state_dict(),
+            'teacher': teacher.state_dict() if args.use_dual_net else None,
             'optimizer': optimizer.state_dict(),
             'epoch': epoch + 1,
             'args': args,
@@ -244,7 +270,7 @@ def train_supconcen(args):
 
 
 def train_one_epoch(student, teacher, teacher_without_ddp, criterion, data_loader, aug_count,
-                    optimizer, lr_schedule, wd_schedule, momentum_schedule,epoch, num_lbls, args):
+                    optimizer, lr_schedule, wd_schedule, momentum_schedule,epoch, num_lbls, means, alpha, args):
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Epoch: [{}/{}]'.format(epoch, args.epochs)
     for it, (images, labels) in enumerate(metric_logger.log_every(data_loader, 10, header)):
@@ -261,32 +287,36 @@ def train_one_epoch(student, teacher, teacher_without_ddp, criterion, data_loade
                 images_all = images_all.cuda(non_blocking=True)
                 labels = labels.cuda(non_blocking=True)
 
-            teacher_output = teacher(images_all)
+            if args.use_dual_net:
+                teacher_output = teacher(images_all)
+                t_features = utils.collect_output(teacher_output, args.batch_size_per_gpu, aug_count)
+            
             student_output = student(images_all)
-            
-            f_t_all = torch.split(teacher_output, [args.batch_size_per_gpu] * aug_count, dim=0)
-            f_s_all = torch.split(student_output, [args.batch_size_per_gpu] * aug_count, dim=0)
-            
-            t_features = torch.cat([f.unsqueeze(1) for f in f_t_all], dim=1)
-            s_features = torch.cat([f.unsqueeze(1) for f in f_s_all], dim=1)
+            s_features = utils.collect_output(student_output, args.batch_size_per_gpu, aug_count)
 
             c_ft, c_lbl = None, None
 
             if args.use_centroid:
-                aug_n, embed_dim = t_features.shape[1], t_features.shape[2]
-                # [bz, aug_n, embed_dim] t_features
-                # [bz, embed_dim] aug_mean_ft
-                aug_mean_ft = torch.mean(t_features, 1, dtype=torch.float).cuda()
-                mean = torch.zeros(num_lbls, embed_dim).cuda()
-                m = m.scatter_reduce(0, lb, aug_m,\
-                    reduce="mean", include_self=False)
-                mean = mean.scatter_reduce(0, labels.contiguous().view(-1, 1).repeat(1, embed_dim).cuda(), aug_mean_ft,\
-                    reduce="mean", include_self=False)
-                non_empty_mask = mean.abs().sum(dim=1).bool().cuda()
-                c_ft = mean[non_empty_mask,:]
-                c_lbl = torch.cat((labels, torch.unique(labels)))
-
-                loss = criterion(s_features, labels, centroid_ft=c_ft, centroid_lbl=c_lbl)
+                if args.use_fixed_centroids:
+                    c_lbl = torch.unique(labels).cuda()
+                    c_ft = means[c_lbl,:]
+                else:
+                    # if args.use_dual_net:
+                    #     aug_n, embed_dim = t_features.shape[1], t_features.shape[2]
+                    #     aug_mean_ft = torch.mean(t_features, 1, dtype=torch.float).cuda()
+                    # else:
+                    aug_n, embed_dim = s_features.shape[1], s_features.shape[2]
+                    # [bz, aug_n, embed_dim] t_features
+                    # [bz, embed_dim] aug_mean_ft
+                    aug_mean_ft = torch.mean(s_features, 1, dtype=torch.float).cuda()
+                    mean = torch.zeros(num_lbls, embed_dim).cuda()
+                    mean = mean.scatter_reduce(0, labels.contiguous().view(-1, 1).repeat(1, embed_dim).cuda(),\
+                        aug_mean_ft, reduce="mean", include_self=False)
+                    non_empty_mask = mean.abs().sum(dim=1).bool().cuda()
+                    c_ft = mean[non_empty_mask,:]
+                    c_lbl = torch.unique(labels)
+                
+                loss = criterion(s_features, labels, centroid_ft=c_ft, centroid_lbl=c_lbl, alpha=alpha)
             else:
                 loss = criterion(student_output, teacher_output, epoch)
             
@@ -307,10 +337,11 @@ def train_one_epoch(student, teacher, teacher_without_ddp, criterion, data_loade
         optimizer.step()
 
         # EMA update for the teacher
-        with torch.no_grad():
-            m = momentum_schedule[it]  # momentum parameter
-            for param_q, param_k in zip(student.module.parameters(), teacher_without_ddp.parameters()):
-                param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
+        if args.use_dual_net:
+            with torch.no_grad():
+                m = momentum_schedule[it]  # momentum parameter
+                for param_q, param_k in zip(student.module.parameters(), teacher_without_ddp.parameters()):
+                    param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
 
         # logging
         torch.cuda.synchronize()

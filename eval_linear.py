@@ -23,10 +23,9 @@ import torch.backends.cudnn as cudnn
 from torchvision import datasets
 from torchvision import transforms as pth_transforms
 from torchvision import models as torchvision_models
-from resnet_big import SupConResNet
+from resnet_big import SupConResNet#, LinearClassifier
 
 import utils
-import vision_transformer as vits
 
 
 def eval_linear(args):
@@ -37,25 +36,17 @@ def eval_linear(args):
 
     # ============ building network ... ============
     # if the network is a Vision Transformer (i.e. vit_tiny, vit_small, vit_base)
-    if args.arch in vits.__dict__.keys():
-        model = vits.__dict__[args.arch](patch_size=args.patch_size, num_classes=0)
-        embed_dim = model.embed_dim * (args.n_last_blocks + int(args.avgpool_patchtokens))
-    # if the network is a XCiT
-    elif "xcit" in args.arch:
-        model = torch.hub.load('facebookresearch/xcit:main', args.arch, num_classes=0)
-        embed_dim = model.embed_dim
-    # otherwise, we check if the architecture is in torchvision models
-    elif args.arch in torchvision_models.__dict__.keys():
+    if args.arch in torchvision_models.__dict__.keys():
         # model = torchvision_models.__dict__[args.arch]()
         # embed_dim = model.fc.weight.shape[1]
         # model.fc = nn.Identity()
 
         model = SupConResNet(name=args.arch)
-        embed_dim = 128
-
+        embed_dim = 2048
     else:
         print(f"Unknow architecture: {args.arch}")
         sys.exit(1)
+
     model.cuda()
     model.eval()
     # load weights to evaluate
@@ -63,6 +54,7 @@ def eval_linear(args):
     print(f"Model {args.arch} built.")
 
     linear_classifier = LinearClassifier(embed_dim, num_labels=args.num_labels)
+    # linear_classifier = LinearClassifier(name=args.arch, num_classes=args.num_labels)
     linear_classifier = linear_classifier.cuda()
     linear_classifier = nn.parallel.DistributedDataParallel(linear_classifier, device_ids=[args.gpu])
 
@@ -90,7 +82,7 @@ def eval_linear(args):
             dataset_train = datasets.CIFAR10(args.data_path, transform=train_transform, train=True)
         elif args.dataset_name == 'cifar100':
             dataset_val = datasets.CIFAR100(args.data_path, transform=val_transform, train=False)
-            dataset_train = datasets.CIFAR10(args.data_path, transform=train_transform, train=True)
+            dataset_train = datasets.CIFAR100(args.data_path, transform=train_transform, train=True)
     elif args.dataset_name == 'imagenet':
         val_transform = pth_transforms.Compose([
             pth_transforms.Resize(256, interpolation=3),
@@ -160,7 +152,7 @@ def eval_linear(args):
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                      'epoch': epoch}
         if epoch % args.val_freq == 0 or epoch == args.epochs - 1:
-            test_stats = validate_network(val_loader, model, linear_classifier, args.n_last_blocks, args.avgpool_patchtokens)
+            test_stats = validate_network(val_loader, model, linear_classifier, args.n_last_blocks, args.avgpool_patchtokens, args.num_labels)
             print(f"Accuracy at epoch {epoch} of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
             best_acc = max(best_acc, test_stats["acc1"])
             print(f'Max accuracy so far: {best_acc:.2f}%')
@@ -186,6 +178,8 @@ def train(model, linear_classifier, optimizer, loader, epoch, n, avgpool):
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     header = 'Epoch: [{}]'.format(epoch)
+    criterion = torch.nn.CrossEntropyLoss()
+    criterion = criterion.cuda()
     for (inp, target) in metric_logger.log_every(loader, 20, header):
         # move to gpu
         inp = inp.cuda(non_blocking=True)
@@ -193,18 +187,14 @@ def train(model, linear_classifier, optimizer, loader, epoch, n, avgpool):
 
         # forward
         with torch.no_grad():
-            if "vit" in args.arch:
-                intermediate_output = model.get_intermediate_layers(inp, n)
-                output = torch.cat([x[:, 0] for x in intermediate_output], dim=-1)
-                if avgpool:
-                    output = torch.cat((output.unsqueeze(-1), torch.mean(intermediate_output[-1][:, 1:], dim=1).unsqueeze(-1)), dim=-1)
-                    output = output.reshape(output.shape[0], -1)
-            else:
-                output = model(inp)
-        output = linear_classifier(output)
+            # output = model(inp)
+            output = model.encoder(inp)
+
+        output = linear_classifier(output.detach())
 
         # compute cross entropy loss
-        loss = nn.CrossEntropyLoss()(output, target)
+        # loss = nn.CrossEntropyLoss()(output, target)
+        loss = criterion(output, target)
 
         # compute the gradients
         optimizer.zero_grad()
@@ -224,7 +214,7 @@ def train(model, linear_classifier, optimizer, loader, epoch, n, avgpool):
 
 
 @torch.no_grad()
-def validate_network(val_loader, model, linear_classifier, n, avgpool):
+def validate_network(val_loader, model, linear_classifier, n, avgpool, num_labels):
     linear_classifier.eval()
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Test:'
@@ -234,19 +224,15 @@ def validate_network(val_loader, model, linear_classifier, n, avgpool):
         target = target.cuda(non_blocking=True)
 
         # forward
-        with torch.no_grad():
-            if "vit" in args.arch:
-                intermediate_output = model.get_intermediate_layers(inp, n)
-                output = torch.cat([x[:, 0] for x in intermediate_output], dim=-1)
-                if avgpool:
-                    output = torch.cat((output.unsqueeze(-1), torch.mean(intermediate_output[-1][:, 1:], dim=1).unsqueeze(-1)), dim=-1)
-                    output = output.reshape(output.shape[0], -1)
-            else:
-                output = model(inp)
+        # with torch.no_grad():
+            # output = model(inp)
+        output = model.encoder(inp)
+
         output = linear_classifier(output)
         loss = nn.CrossEntropyLoss()(output, target)
 
-        if linear_classifier.module.num_labels >= 5:
+        # if linear_classifier.module.num_labels >= 5:
+        if num_labels >= 5:
             acc1, acc5 = utils.accuracy(output, target, topk=(1, 5))
         else:
             acc1, = utils.accuracy(output, target, topk=(1,))
@@ -254,9 +240,11 @@ def validate_network(val_loader, model, linear_classifier, n, avgpool):
         batch_size = inp.shape[0]
         metric_logger.update(loss=loss.item())
         metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
-        if linear_classifier.module.num_labels >= 5:
+        # if linear_classifier.module.num_labels >= 5:
+        if num_labels >= 5:
             metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
-    if linear_classifier.module.num_labels >= 5:
+    # if linear_classifier.module.num_labels >= 5:
+    if num_labels >= 5:
         print('* Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} loss {losses.global_avg:.3f}'
           .format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.loss))
     else:
@@ -277,7 +265,6 @@ class LinearClassifier(nn.Module):
     def forward(self, x):
         # flatten
         x = x.view(x.size(0), -1)
-
         # linear layer
         return self.linear(x)
 
